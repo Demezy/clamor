@@ -97,15 +97,15 @@ pub fn send_message<W: Write>(writer: &mut W, msg: &impl Serialize) -> Result<()
 #[allow(dead_code)]
 pub fn recv_message<T: DeserializeOwned, R: Read>(reader: &mut R) -> Result<T> {
     let mut len_buf = [0u8; 4];
-    reader
-        .read_exact(&mut len_buf)
-        .context("reading length prefix")?;
+    if let Err(e) = reader.read_exact(&mut len_buf) {
+        return Err(map_recv_error(e, "length prefix"));
+    }
     let len = u32::from_be_bytes(len_buf) as usize;
 
     let mut buf = vec![0u8; len];
-    reader
-        .read_exact(&mut buf)
-        .context("reading message body")?;
+    if let Err(e) = reader.read_exact(&mut buf) {
+        return Err(map_recv_error(e, "message body"));
+    }
 
     serde_json::from_slice(&buf).context("deserializing message")
 }
@@ -134,17 +134,32 @@ pub async fn recv_message_async<T: DeserializeOwned, R: AsyncRead + Unpin>(
     reader: &mut R,
 ) -> Result<T> {
     let mut len_buf = [0u8; 4];
-    reader
-        .read_exact(&mut len_buf)
-        .await
-        .context("reading length prefix")?;
+    if let Err(e) = reader.read_exact(&mut len_buf).await {
+        return Err(map_recv_error(e, "length prefix"));
+    }
     let len = u32::from_be_bytes(len_buf) as usize;
 
     let mut buf = vec![0u8; len];
-    reader
-        .read_exact(&mut buf)
-        .await
-        .context("reading message body")?;
+    if let Err(e) = reader.read_exact(&mut buf).await {
+        return Err(map_recv_error(e, "message body"));
+    }
 
     serde_json::from_slice(&buf).context("deserializing message")
+}
+
+/// Map an io error from a recv into an actionable anyhow error.
+///
+/// `UnexpectedEof` here almost always means the daemon dropped our connection —
+/// either because another clamor process connected (the daemon only holds one
+/// client at a time) or because the daemon exited. Surface that explicitly so
+/// users don't have to puzzle out a bare "early eof".
+fn map_recv_error(e: std::io::Error, stage: &'static str) -> anyhow::Error {
+    if e.kind() == std::io::ErrorKind::UnexpectedEof {
+        return anyhow::anyhow!(
+            "daemon connection closed mid-message (reading {stage}). \
+             Likely another clamor process connected, or the daemon exited. \
+             See ~/.clamor/daemon.log."
+        );
+    }
+    anyhow::Error::new(e).context(format!("reading {stage}"))
 }

@@ -125,6 +125,27 @@ pub fn daemon_pid_path() -> Result<PathBuf> {
     Ok(crate::config::ClamorConfig::runtime_dir()?.join("clamor.pid"))
 }
 
+pub fn daemon_log_path() -> Result<PathBuf> {
+    Ok(crate::config::ClamorConfig::runtime_dir()?.join("daemon.log"))
+}
+
+/// Append a timestamped line to the daemon log. Best-effort; never fails the caller.
+fn daemon_log(msg: &str) {
+    let Ok(path) = daemon_log_path() else { return };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        let ts = chrono::Utc::now().to_rfc3339();
+        let pid = std::process::id();
+        let _ = writeln!(f, "{ts} pid={pid} {msg}");
+    }
+}
+
 pub fn is_daemon_running() -> bool {
     let pid_path = match daemon_pid_path() {
         Ok(p) => p,
@@ -143,11 +164,30 @@ pub fn is_daemon_running() -> bool {
 
 pub fn start_daemon_background() -> Result<()> {
     let exe = std::env::current_exe().context("resolving clamor executable path")?;
+
+    // Send daemon stderr to the log file so panics and `eprintln!`s are not
+    // silently dropped. Fall back to /dev/null only if the log file can't be
+    // opened.
+    let stderr = match daemon_log_path() {
+        Ok(path) => {
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .map(std::process::Stdio::from)
+                .unwrap_or_else(|_| std::process::Stdio::null())
+        }
+        Err(_) => std::process::Stdio::null(),
+    };
+
     std::process::Command::new(exe)
         .arg("daemon")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stderr(stderr)
         .spawn()
         .context("spawning daemon process")?;
 
@@ -1068,6 +1108,7 @@ pub async fn run_daemon() -> Result<()> {
 
     if sock_path.exists() {
         if is_daemon_running() {
+            daemon_log("startup aborted: daemon already running");
             bail!("daemon already running (socket exists and PID is alive)");
         }
         let _ = std::fs::remove_file(&sock_path);
@@ -1076,6 +1117,14 @@ pub async fn run_daemon() -> Result<()> {
     std::fs::write(&pid_path, std::process::id().to_string()).context("writing PID file")?;
 
     let listener = UnixListener::bind(&sock_path).context("binding Unix domain socket")?;
+
+    daemon_log(&format!(
+        "daemon started version={} sock={}",
+        env!("CARGO_PKG_VERSION"),
+        sock_path.display()
+    ));
+
+    install_daemon_panic_hook();
 
     let (pty_tx, mut pty_rx) = mpsc::channel::<PtyEvent>(1024);
 
@@ -1097,10 +1146,18 @@ pub async fn run_daemon() -> Result<()> {
             result = listener.accept() => {
                 match result {
                     Ok((stream, _)) => {
+                        if client.is_some() {
+                            daemon_log(
+                                "client connected; previous client dropped (only one client supported)"
+                            );
+                        } else {
+                            daemon_log("client connected");
+                        }
                         subscriptions.clear();
                         client = Some(stream);
                     }
                     Err(e) => {
+                        daemon_log(&format!("accept error: {e}"));
                         eprintln!("clamor-daemon: accept error: {e}");
                     }
                 }
@@ -1164,10 +1221,14 @@ pub async fn run_daemon() -> Result<()> {
                             msg, &mut agents, &mut subscriptions, stream, &pty_tx,
                         ).await {
                             HandleResult::Continue => {}
-                            HandleResult::Shutdown => break,
+                            HandleResult::Shutdown => {
+                                daemon_log("shutdown requested by client");
+                                break;
+                            }
                         }
                     }
-                    Err(_) => {
+                    Err(e) => {
+                        daemon_log(&format!("client read ended: {e:#}"));
                         client = None;
                         subscriptions.clear();
                     }
@@ -1192,7 +1253,17 @@ pub async fn run_daemon() -> Result<()> {
     let _ = std::fs::remove_file(&sock_path);
     let _ = std::fs::remove_file(&pid_path);
 
+    daemon_log("daemon stopped");
+
     Ok(())
+}
+
+fn install_daemon_panic_hook() {
+    let original = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        daemon_log(&format!("PANIC: {info}"));
+        original(info);
+    }));
 }
 
 enum HandleResult {
