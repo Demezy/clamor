@@ -75,7 +75,16 @@ Current protocol messages include `Hello { version }` for version exchange betwe
 
 ### Terminal (attached)
 
-- `Ctrl+F` — detach (back to dashboard)
+All bindings below are user-configurable via `terminal.bindings` in
+`~/.config/clamor/config.yaml`. Combos absent from the resolved keymap are
+forwarded to the agent's PTY (so e.g. dropping `ctrl-j` makes Claude Code
+receive `Ctrl+J` as a newline). The full chord/action language and an
+example are in the README. Resolution lives in `src/dashboard/keymap.rs`;
+dispatch in `dispatch_terminal_action` (`src/dashboard/mod.rs`).
+
+Defaults:
+
+- `Ctrl+F` — detach (back to dashboard) — **cannot be omitted**, validated at startup
 - `Ctrl+C` — send SIGINT to agent
 - `Ctrl+J` — snap to bottom (live view)
 - `Ctrl+G` / `Ctrl+Shift+G` — jump to next/prev agent in `Input` state (stays put with a flash if none)

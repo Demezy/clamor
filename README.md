@@ -200,11 +200,44 @@ clamor stop             Stop the daemon
 
 ### Terminal keys
 
-| Key      | Action                     |
-| -------- | -------------------------- |
-| `Ctrl+F` | Detach (back to dashboard) |
-| `Ctrl+C` | Send SIGINT to agent       |
-| `Ctrl+J` | Snap to bottom (live view) |
+| Key       | Action                                   |
+| --------- | ---------------------------------------- |
+| `Ctrl+F`  | Detach (back to dashboard)               |
+| `Ctrl+C`  | Send SIGINT to agent                     |
+| `Ctrl+G`  | Jump to next agent waiting for input     |
+| `Ctrl+Shift+G` | Jump to previous agent waiting for input |
+| `Ctrl+J`  | Snap to bottom (live view)               |
+| `Ctrl+R`  | Refresh terminal (rebuild from buffer)   |
+| `Ctrl+S`  | Enter copy mode                          |
+
+All terminal keys are user-configurable. Any combo not listed below is
+forwarded directly to the agent — so wrapped tools like Claude Code receive
+their own `Ctrl+R`, `Ctrl+S`, etc. as expected.
+
+#### Customizing terminal keys
+
+Add a `terminal:` section to `~/.config/clamor/config.yaml`. Listing
+`bindings:` opts you out of the defaults entirely — list every chord you
+want clamor to intercept; everything else passes through to the agent.
+
+```yaml
+terminal:
+  bindings:
+    ctrl-f: detach          # required — without this you cannot escape the agent
+    ctrl-c: sigint
+    ctrl-g: jump-input-next
+    ctrl-shift-g: jump-input-prev
+    # ctrl-j: snap-to-bottom    # commented out → Ctrl+J reaches Claude Code as a newline
+    # ctrl-s: enter-copy-mode   # commented out → Ctrl+S reaches Claude Code's search
+    # ctrl-r: refresh-parser    # commented out → Ctrl+R reaches Claude Code's verbose toggle
+    alt-r: refresh-parser   # remap: refresh now lives on Alt+R
+```
+
+Available actions: `detach`, `sigint`, `jump-input-next`, `jump-input-prev`,
+`snap-to-bottom`, `enter-copy-mode`, `refresh-parser`. Chord syntax is
+`[ctrl-][shift-][alt-]<letter>` (modifier order does not matter; uppercase
+letters are equivalent to `shift-<lowercase>`). Clamor refuses to start if
+the resolved bindings do not include `detach`.
 
 ## Architecture
 

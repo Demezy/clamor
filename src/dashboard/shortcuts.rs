@@ -172,30 +172,40 @@ pub const DASHBOARD_SHORTCUTS: &[Shortcut] = &[
     },
 ];
 
+/// Defaults shown for the attached terminal. All entries except `^F` (detach)
+/// can be omitted or remapped via the `terminal.bindings` section in
+/// `~/.config/clamor/config.yaml`. Combos absent from the resolved keymap are
+/// forwarded to the agent's PTY, so wrapped tools like Claude Code receive
+/// their own Ctrl+R / Ctrl+S / Ctrl+J as expected.
 pub const TERMINAL_SHORTCUTS: &[Shortcut] = &[
     Shortcut {
         keys: "^F",
-        description: "detach (back to dashboard)",
+        description: "detach (back to dashboard) — required, cannot be unbound",
         footer: None,
     },
     Shortcut {
         keys: "^C",
-        description: "send SIGINT to agent",
+        description: "send SIGINT to agent (configurable)",
         footer: None,
     },
     Shortcut {
         keys: "^J",
-        description: "snap to bottom (live view)",
+        description: "snap to bottom (configurable)",
         footer: None,
     },
     Shortcut {
         keys: "^G / ^\u{21E7}G",
-        description: "jump to next / prev agent waiting for input",
+        description: "jump to next / prev agent waiting for input (configurable)",
+        footer: None,
+    },
+    Shortcut {
+        keys: "^R",
+        description: "refresh terminal (configurable)",
         footer: None,
     },
     Shortcut {
         keys: "^S",
-        description: "enter copy mode",
+        description: "enter copy mode (configurable)",
         footer: None,
     },
     Shortcut {
