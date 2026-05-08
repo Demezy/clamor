@@ -18,6 +18,8 @@ pub struct ClamorConfig {
     #[serde(default)]
     pub dashboard: DashboardConfig,
     #[serde(default)]
+    pub terminal: TerminalConfig,
+    #[serde(default)]
     pub theme: ThemeConfig,
 }
 
@@ -193,6 +195,7 @@ pub fn example_config() -> ClamorConfig {
             ("open-code".to_string(), open_code),
         ]),
         dashboard: DashboardConfig::default(),
+        terminal: TerminalConfig::default(),
         theme: ThemeConfig::default(),
     }
 }
@@ -203,6 +206,7 @@ pub fn serialize_config_yaml(config: &ClamorConfig) -> anyhow::Result<String> {
         backends: BTreeMap<String, BackendConfig>,
         folders: BTreeMap<String, FolderConfig>,
         dashboard: DashboardConfig,
+        terminal: TerminalConfig,
         theme: ThemeConfig,
     }
 
@@ -210,6 +214,7 @@ pub fn serialize_config_yaml(config: &ClamorConfig) -> anyhow::Result<String> {
         backends: config.backends.clone().into_iter().collect(),
         folders: config.folders.clone().into_iter().collect(),
         dashboard: config.dashboard.clone(),
+        terminal: config.terminal.clone(),
         theme: config.theme.clone(),
     };
 
@@ -426,6 +431,38 @@ pub enum WatchMode {
     #[default]
     Fsevents,
     Poll,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "kebab-case")]
+pub enum TerminalAction {
+    /// Detach from the agent and return to the dashboard.
+    Detach,
+    /// Send SIGINT to the agent (via the daemon, not raw 0x03).
+    Sigint,
+    /// Jump to the next agent in `Input` state.
+    JumpInputNext,
+    /// Jump to the previous agent in `Input` state.
+    JumpInputPrev,
+    /// Snap the live view to the bottom of the scrollback.
+    SnapToBottom,
+    /// Enter vim-style copy mode.
+    EnterCopyMode,
+    /// Rebuild the daemon parser from the ring buffer.
+    RefreshParser,
+}
+
+/// Bindings for the attached-terminal mode. Any `Ctrl+<key>` (and similar)
+/// combo not present in `bindings` is forwarded to the agent's PTY.
+///
+/// Absence of the entire `terminal:` section yields an empty map; the keymap
+/// resolver then falls back to the built-in defaults. Presence of `bindings:`
+/// (even an empty map) means "the user is taking over" — only listed combos
+/// are intercepted.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct TerminalConfig {
+    #[serde(default)]
+    pub bindings: HashMap<String, TerminalAction>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -702,6 +739,55 @@ mod tests {
             chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
         );
         std::env::temp_dir().join(unique).join(name)
+    }
+
+    #[test]
+    fn parses_terminal_bindings_from_yaml() {
+        let config: ClamorConfig = serde_yaml::from_str(
+            r#"
+terminal:
+  bindings:
+    ctrl-f: detach
+    ctrl-c: sigint
+    ctrl-r: refresh-parser
+"#,
+        )
+        .unwrap();
+
+        let bindings = &config.terminal.bindings;
+        assert_eq!(bindings.get("ctrl-f"), Some(&TerminalAction::Detach));
+        assert_eq!(bindings.get("ctrl-c"), Some(&TerminalAction::Sigint));
+        assert_eq!(
+            bindings.get("ctrl-r"),
+            Some(&TerminalAction::RefreshParser)
+        );
+    }
+
+    #[test]
+    fn terminal_config_defaults_to_empty_bindings_map() {
+        let config: ClamorConfig = serde_yaml::from_str("{}").unwrap();
+        assert!(
+            config.terminal.bindings.is_empty(),
+            "absence of `terminal:` should yield an empty bindings map; \
+             defaults are applied at keymap-resolution time"
+        );
+    }
+
+    #[test]
+    fn terminal_action_round_trips_via_yaml() {
+        for (s, expected) in [
+            ("detach", TerminalAction::Detach),
+            ("sigint", TerminalAction::Sigint),
+            ("jump-input-next", TerminalAction::JumpInputNext),
+            ("jump-input-prev", TerminalAction::JumpInputPrev),
+            ("snap-to-bottom", TerminalAction::SnapToBottom),
+            ("enter-copy-mode", TerminalAction::EnterCopyMode),
+            ("refresh-parser", TerminalAction::RefreshParser),
+        ] {
+            let parsed: TerminalAction =
+                serde_yaml::from_str(s).unwrap_or_else(|e| panic!("parse {s}: {e}"));
+            assert_eq!(parsed, expected, "string `{s}` should parse to {expected:?}");
+        }
     }
 
     #[test]
