@@ -1,4 +1,5 @@
 mod input;
+pub(crate) mod keymap;
 pub(crate) mod keys;
 pub(crate) mod render;
 pub mod shortcuts;
