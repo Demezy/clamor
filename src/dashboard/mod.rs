@@ -27,10 +27,12 @@ use ratatui::Terminal;
 
 use crate::agent::{generate_id, next_color_index, Agent, AgentState};
 use crate::client::DaemonClient;
-use crate::config::{resolve_path, ClamorConfig};
+use crate::config::{resolve_path, ClamorConfig, TerminalAction};
 use crate::daemon;
 use crate::pane::{self, PaneView};
 use crate::protocol::DaemonMessage;
+
+use keymap::KeyChord;
 use crate::state::{
     cycle_backend_for_folder, selected_backend_for_folder, with_state, ClamorState,
     PromptHistoryEntry,
@@ -171,6 +173,11 @@ pub async fn run(config: &ClamorConfig, attach_to: Option<String>) -> Result<()>
     with_state(|state| crate::state::reconcile_folder_backend_selections(config, state))?;
     let mut client = DaemonClient::connect().await?;
 
+    // Resolve the user's terminal keymap before touching the screen, so a
+    // bad config produces a clean stderr error rather than a mangled tty.
+    let terminal_keymap =
+        keymap::resolve(&config.terminal).context("Invalid terminal.bindings config")?;
+
     let (term_cols, term_rows) = crossterm::terminal::size().unwrap_or((80, 24));
     reconcile_state(config, &mut client, term_rows, term_cols).await?;
 
@@ -189,7 +196,15 @@ pub async fn run(config: &ClamorConfig, attach_to: Option<String>) -> Result<()>
         )?;
     }
 
-    let result = main_loop(&mut terminal, config, &mut client, attach_to, &state_source).await;
+    let result = main_loop(
+        &mut terminal,
+        config,
+        &mut client,
+        attach_to,
+        &state_source,
+        &terminal_keymap,
+    )
+    .await;
 
     if has_keyboard_enhancement {
         execute!(io::stdout(), PopKeyboardEnhancementFlags)?;
@@ -241,6 +256,7 @@ async fn main_loop(
     client: &mut DaemonClient,
     attach_to: Option<String>,
     state_source: &StateSource,
+    terminal_keymap: &HashMap<KeyChord, TerminalAction>,
 ) -> Result<()> {
     let mut input_mode = InputMode::Normal;
     let mut killed_at: HashMap<String, Instant> = HashMap::new();
@@ -363,6 +379,7 @@ async fn main_loop(
                                 client,
                                 agent_id,
                                 &mut pane_views,
+                                terminal_keymap,
                             ).await?
                         }
                     };
@@ -1958,12 +1975,73 @@ fn handle_copy_mode_key(
     Ok(LoopAction::Continue)
 }
 
+/// Execute a `TerminalAction` resolved from the user keymap. Kept separate
+/// from `handle_terminal_event` so the dispatcher logic stays linear and
+/// each branch matches the action enum 1:1.
+async fn dispatch_terminal_action(
+    action: TerminalAction,
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    client: &mut DaemonClient,
+    agent_id: &str,
+    pane_views: &mut HashMap<String, PaneView>,
+    content_rows: u16,
+    term_cols: u16,
+) -> Result<LoopAction> {
+    match action {
+        TerminalAction::Detach => Ok(LoopAction::SwitchToDashboard),
+        TerminalAction::JumpInputNext => Ok(LoopAction::JumpInput(true)),
+        TerminalAction::JumpInputPrev => Ok(LoopAction::JumpInput(false)),
+        TerminalAction::Sigint => {
+            let _ = client.send_sigint(agent_id).await;
+            let id = agent_id.to_owned();
+            let _ = with_state(|state| {
+                if let Some(agent) = state.agents.get_mut(&id) {
+                    agent.state = AgentState::Input;
+                }
+            });
+            Ok(LoopAction::Continue)
+        }
+        TerminalAction::SnapToBottom => {
+            if let Some(pv) = pane_views.get_mut(agent_id) {
+                pv.snap_to_bottom();
+            }
+            Ok(LoopAction::Continue)
+        }
+        TerminalAction::EnterCopyMode => {
+            if let Some(pv) = pane_views.get_mut(agent_id) {
+                pv.enter_copy_mode(content_rows, term_cols);
+            }
+            Ok(LoopAction::Continue)
+        }
+        TerminalAction::RefreshParser => {
+            if let Ok(result) = client.refresh_parser_buffered(agent_id).await {
+                let pv = if result.catch_up.is_empty() {
+                    PaneView::new(content_rows, term_cols)
+                } else {
+                    PaneView::from_catch_up(content_rows, term_cols, &result.catch_up)
+                };
+                pane_views.insert(agent_id.to_string(), pv);
+                for msg in result.buffered {
+                    if let DaemonMessage::Output { ref id, ref data } = msg {
+                        if let Some(pv) = pane_views.get_mut(id.as_str()) {
+                            pv.process_output(data);
+                        }
+                    }
+                }
+                terminal.clear()?;
+            }
+            Ok(LoopAction::Continue)
+        }
+    }
+}
+
 async fn handle_terminal_event(
     ev: &Event,
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     client: &mut DaemonClient,
     agent_id: &str,
     pane_views: &mut HashMap<String, PaneView>,
+    terminal_keymap: &HashMap<KeyChord, TerminalAction>,
 ) -> Result<LoopAction> {
     let (term_cols, term_rows) = crossterm::terminal::size().unwrap_or((80, 24));
     let content_rows = term_rows.saturating_sub(1);
@@ -1986,81 +2064,22 @@ async fn handle_terminal_event(
                 );
             }
 
-            // Ctrl+F -> back to dashboard (stay subscribed so pane
-            // keeps receiving live output while on the dashboard)
-            if key_event.modifiers.contains(KeyModifiers::CONTROL)
-                && key_event.code == KeyCode::Char('f')
+            // Configurable keymap: any chord present in `terminal_keymap`
+            // is intercepted; everything else falls through to the PTY.
+            // See src/dashboard/keymap.rs for the default bindings.
+            if let Some(action) = KeyChord::from_key_event(key_event)
+                .and_then(|chord| terminal_keymap.get(&chord).copied())
             {
-                return Ok(LoopAction::SwitchToDashboard);
-            }
-
-            // Ctrl+G / Ctrl+Shift+G -> jump to next/prev agent in Input state.
-            // Shifted form arrives as KeyCode::Char('G') on most terminals; on
-            // terminals with disambiguating escape codes the SHIFT modifier may
-            // also be set, so accept either signal.
-            if key_event.modifiers.contains(KeyModifiers::CONTROL)
-                && matches!(key_event.code, KeyCode::Char('g') | KeyCode::Char('G'))
-            {
-                let shifted = key_event.modifiers.contains(KeyModifiers::SHIFT)
-                    || matches!(key_event.code, KeyCode::Char('G'));
-                return Ok(LoopAction::JumpInput(!shifted));
-            }
-
-            // Ctrl+C -> send SIGINT to agent
-            if key_event.modifiers.contains(KeyModifiers::CONTROL)
-                && key_event.code == KeyCode::Char('c')
-            {
-                let _ = client.send_sigint(agent_id).await;
-                let id = agent_id.to_owned();
-                let _ = with_state(|state| {
-                    if let Some(agent) = state.agents.get_mut(&id) {
-                        agent.state = AgentState::Input;
-                    }
-                });
-                return Ok(LoopAction::Continue);
-            }
-
-            // Ctrl+J -> snap to bottom (live view) without forwarding to PTY
-            if key_event.modifiers.contains(KeyModifiers::CONTROL)
-                && key_event.code == KeyCode::Char('j')
-            {
-                if let Some(pv) = pane_views.get_mut(agent_id) {
-                    pv.snap_to_bottom();
-                }
-                return Ok(LoopAction::Continue);
-            }
-
-            // Ctrl+S -> enter copy mode
-            if key_event.modifiers.contains(KeyModifiers::CONTROL)
-                && key_event.code == KeyCode::Char('s')
-            {
-                if let Some(pv) = pane_views.get_mut(agent_id) {
-                    pv.enter_copy_mode(content_rows, term_cols);
-                }
-                return Ok(LoopAction::Continue);
-            }
-
-            // Ctrl+R -> refresh terminal (rebuild daemon parser from ring buffer)
-            if key_event.modifiers.contains(KeyModifiers::CONTROL)
-                && key_event.code == KeyCode::Char('r')
-            {
-                if let Ok(result) = client.refresh_parser_buffered(agent_id).await {
-                    let pv = if result.catch_up.is_empty() {
-                        PaneView::new(content_rows, term_cols)
-                    } else {
-                        PaneView::from_catch_up(content_rows, term_cols, &result.catch_up)
-                    };
-                    pane_views.insert(agent_id.to_string(), pv);
-                    for msg in result.buffered {
-                        if let DaemonMessage::Output { ref id, ref data } = msg {
-                            if let Some(pv) = pane_views.get_mut(id.as_str()) {
-                                pv.process_output(data);
-                            }
-                        }
-                    }
-                    terminal.clear()?;
-                }
-                return Ok(LoopAction::Continue);
+                return dispatch_terminal_action(
+                    action,
+                    terminal,
+                    client,
+                    agent_id,
+                    pane_views,
+                    content_rows,
+                    term_cols,
+                )
+                .await;
             }
 
             if let Some(pv) = pane_views.get_mut(agent_id) {
