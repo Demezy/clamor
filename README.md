@@ -239,6 +239,13 @@ Available actions: `detach`, `sigint`, `jump-input-next`, `jump-input-prev`,
 letters are equivalent to `shift-<lowercase>`). Clamor refuses to start if
 the resolved bindings do not include `detach`.
 
+> **Note on `ctrl-shift-<letter>`:** distinguishing `Ctrl+Shift+R` from
+> plain `Ctrl+R` requires a terminal that implements the kitty keyboard
+> protocol (CSI-u disambiguation) — Ghostty, kitty, Alacritty, WezTerm,
+> foot, recent iTerm2. On Terminal.app and older tmux, both press the
+> same byte and clamor cannot tell them apart. If a shift-remap doesn't
+> work for you, use `alt-<letter>` instead.
+
 ## Architecture
 
 Clamor uses a daemon-client architecture, similar to tmux:
